@@ -1,62 +1,67 @@
 from __future__ import annotations
 
 import os
-import sqlite3
 from contextlib import contextmanager
+
 from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 load_dotenv()
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "escavador.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não definida.")
+
+# compatibilidade eventual
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine: Engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    future=True,
+)
 
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
+    with engine.begin() as conn:
         yield conn
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def init_db() -> None:
     with get_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("""
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS processos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             numero_cnj TEXT NOT NULL UNIQUE,
-            origem TEXT NOT NULL,
-            monitoramento_id INTEGER,
-            monitoramento_ativo INTEGER NOT NULL DEFAULT 0,
+            tribunal TEXT NOT NULL,
+            monitoramento_id BIGINT,
             frequencia TEXT,
             status_monitoramento TEXT,
-            criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
-            atualizado_em TEXT DEFAULT CURRENT_TIMESTAMP
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """))
 
-        cur.execute("""
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS consultas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            processo_id INTEGER NOT NULL,
-            busca_async_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            processo_id BIGINT NOT NULL REFERENCES processos(id),
+            busca_async_id BIGINT,
             status TEXT,
             tipo TEXT,
             valor TEXT,
             resposta_json TEXT,
-            criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (processo_id) REFERENCES processos(id)
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """))
 
-        cur.execute("""
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS movimentacoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            processo_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            processo_id BIGINT NOT NULL REFERENCES processos(id),
             data_movimentacao TEXT,
             conteudo TEXT NOT NULL,
             instancia TEXT,
@@ -64,63 +69,62 @@ def init_db() -> None:
             classe TEXT,
             assunto TEXT,
             origem_evento TEXT,
-            hash_unico TEXT NOT NULL UNIQUE,
+            chave_unica TEXT NOT NULL UNIQUE,
             payload_json TEXT,
-            criado_em TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (processo_id) REFERENCES processos(id)
+            criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """))
 
-        cur.execute("""
+        conn.execute(text("""
         CREATE TABLE IF NOT EXISTS callbacks_recebidos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             evento TEXT,
             item_id_externo TEXT,
-            status_callback TEXT,
             payload_json TEXT NOT NULL,
-            recebido_em TEXT DEFAULT CURRENT_TIMESTAMP
+            recebido_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-        """)
+        """))
 
 
-def upsert_processo(numero_cnj: str, origem: str) -> int:
+def upsert_processo(numero_cnj: str, tribunal: str) -> int:
     with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO processos (numero_cnj, origem)
-            VALUES (?, ?)
-            ON CONFLICT(numero_cnj) DO UPDATE SET
-                origem=excluded.origem,
-                atualizado_em=CURRENT_TIMESTAMP
-        """, (numero_cnj, origem))
-        cur.execute("SELECT id FROM processos WHERE numero_cnj = ?", (numero_cnj,))
-        row = cur.fetchone()
+        conn.execute(text("""
+            INSERT INTO processos (numero_cnj, tribunal)
+            VALUES (:numero_cnj, :tribunal)
+            ON CONFLICT (numero_cnj)
+            DO UPDATE SET
+                tribunal = EXCLUDED.tribunal,
+                atualizado_em = CURRENT_TIMESTAMP
+        """), {"numero_cnj": numero_cnj, "tribunal": tribunal})
+
+        row = conn.execute(
+            text("SELECT id FROM processos WHERE numero_cnj = :numero_cnj"),
+            {"numero_cnj": numero_cnj},
+        ).mappings().first()
+
         return int(row["id"])
 
 
-def atualizar_monitoramento_processo(
+def atualizar_monitoramento(
     numero_cnj: str,
     monitoramento_id: int | None,
-    ativo: bool,
     frequencia: str | None,
-    status_monitoramento: str | None = None,
+    status_monitoramento: str | None,
 ) -> None:
     with get_conn() as conn:
-        conn.execute("""
+        conn.execute(text("""
             UPDATE processos
-            SET monitoramento_id = ?,
-                monitoramento_ativo = ?,
-                frequencia = ?,
-                status_monitoramento = ?,
+            SET monitoramento_id = :monitoramento_id,
+                frequencia = :frequencia,
+                status_monitoramento = :status_monitoramento,
                 atualizado_em = CURRENT_TIMESTAMP
-            WHERE numero_cnj = ?
-        """, (
-            monitoramento_id,
-            1 if ativo else 0,
-            frequencia,
-            status_monitoramento,
-            numero_cnj,
-        ))
+            WHERE numero_cnj = :numero_cnj
+        """), {
+            "monitoramento_id": monitoramento_id,
+            "frequencia": frequencia,
+            "status_monitoramento": status_monitoramento,
+            "numero_cnj": numero_cnj,
+        })
 
 
 def salvar_consulta(
@@ -132,13 +136,20 @@ def salvar_consulta(
     resposta_json: str,
 ) -> None:
     with get_conn() as conn:
-        conn.execute("""
+        conn.execute(text("""
             INSERT INTO consultas (
                 processo_id, busca_async_id, status, tipo, valor, resposta_json
-            ) VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            processo_id, busca_async_id, status, tipo, valor, resposta_json
-        ))
+            ) VALUES (
+                :processo_id, :busca_async_id, :status, :tipo, :valor, :resposta_json
+            )
+        """), {
+            "processo_id": processo_id,
+            "busca_async_id": busca_async_id,
+            "status": status,
+            "tipo": tipo,
+            "valor": valor,
+            "resposta_json": resposta_json,
+        })
 
 
 def inserir_movimentacao(
@@ -150,71 +161,87 @@ def inserir_movimentacao(
     classe: str | None,
     assunto: str | None,
     origem_evento: str | None,
-    hash_unico: str,
+    chave_unica: str,
     payload_json: str,
 ) -> bool:
     try:
         with get_conn() as conn:
-            conn.execute("""
+            conn.execute(text("""
                 INSERT INTO movimentacoes (
                     processo_id, data_movimentacao, conteudo, instancia,
                     orgao_julgador, classe, assunto, origem_evento,
-                    hash_unico, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                processo_id, data_movimentacao, conteudo, instancia,
-                orgao_julgador, classe, assunto, origem_evento,
-                hash_unico, payload_json
-            ))
+                    chave_unica, payload_json
+                ) VALUES (
+                    :processo_id, :data_movimentacao, :conteudo, :instancia,
+                    :orgao_julgador, :classe, :assunto, :origem_evento,
+                    :chave_unica, :payload_json
+                )
+            """), {
+                "processo_id": processo_id,
+                "data_movimentacao": data_movimentacao,
+                "conteudo": conteudo,
+                "instancia": instancia,
+                "orgao_julgador": orgao_julgador,
+                "classe": classe,
+                "assunto": assunto,
+                "origem_evento": origem_evento,
+                "chave_unica": chave_unica,
+                "payload_json": payload_json,
+            })
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
         return False
 
 
-def salvar_callback(evento: str | None, item_id_externo: str | None, status_callback: str | None, payload_json: str) -> None:
+def salvar_callback(evento: str | None, item_id_externo: str | None, payload_json: str) -> None:
     with get_conn() as conn:
-        conn.execute("""
-            INSERT INTO callbacks_recebidos (evento, item_id_externo, status_callback, payload_json)
-            VALUES (?, ?, ?, ?)
-        """, (evento, item_id_externo, status_callback, payload_json))
+        conn.execute(text("""
+            INSERT INTO callbacks_recebidos (evento, item_id_externo, payload_json)
+            VALUES (:evento, :item_id_externo, :payload_json)
+        """), {
+            "evento": evento,
+            "item_id_externo": item_id_externo,
+            "payload_json": payload_json,
+        })
 
 
 def listar_processos():
-    with get_conn() as conn:
-        return conn.execute("""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
             SELECT *
             FROM processos
             ORDER BY atualizado_em DESC, id DESC
-        """).fetchall()
+        """)).mappings().all()
+        return [dict(r) for r in rows]
 
 
-def listar_movimentacoes_processo(numero_cnj: str):
-    with get_conn() as conn:
-        return conn.execute("""
-            SELECT m.*, p.numero_cnj, p.origem
-            FROM movimentacoes m
-            JOIN processos p ON p.id = m.processo_id
-            WHERE p.numero_cnj = ?
-            ORDER BY COALESCE(m.data_movimentacao, m.criado_em) DESC, m.id DESC
-        """, (numero_cnj,)).fetchall()
+def listar_movimentacoes(numero_cnj: str | None = None):
+    with engine.connect() as conn:
+        if numero_cnj:
+            rows = conn.execute(text("""
+                SELECT m.*, p.numero_cnj, p.tribunal
+                FROM movimentacoes m
+                JOIN processos p ON p.id = m.processo_id
+                WHERE p.numero_cnj = :numero_cnj
+                ORDER BY m.id DESC
+            """), {"numero_cnj": numero_cnj}).mappings().all()
+        else:
+            rows = conn.execute(text("""
+                SELECT m.*, p.numero_cnj, p.tribunal
+                FROM movimentacoes m
+                JOIN processos p ON p.id = m.processo_id
+                ORDER BY m.id DESC
+            """)).mappings().all()
 
-
-def listar_todas_movimentacoes(limit: int = 200):
-    with get_conn() as conn:
-        return conn.execute("""
-            SELECT m.*, p.numero_cnj, p.origem
-            FROM movimentacoes m
-            JOIN processos p ON p.id = m.processo_id
-            ORDER BY m.id DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
 
 def listar_callbacks(limit: int = 100):
-    with get_conn() as conn:
-        return conn.execute("""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
             SELECT *
             FROM callbacks_recebidos
             ORDER BY id DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+        return [dict(r) for r in rows]

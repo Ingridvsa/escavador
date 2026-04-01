@@ -1,119 +1,93 @@
 from __future__ import annotations
 
-import json
+import os
 import pandas as pd
 import streamlit as st
 
-from db import (
-    init_db,
-    listar_callbacks,
-    listar_movimentacoes_processo,
-    listar_processos,
-    listar_todas_movimentacoes,
-)
-from escavador_api import (
-    EscavadorAPIError,
-    criar_monitoramento,
-    detalhes_origem,
-    listar_monitoramentos,
+from db import init_db, listar_callbacks, listar_movimentacoes, listar_processos
+from escavador_service import (
+    EscavadorErro,
+    criar_monitoramento_tribunal,
     registrar_consulta_inicial,
 )
 
-st.set_page_config(page_title="Monitoramento Escavador", layout="wide")
+st.set_page_config(page_title="Painel de Processos", layout="wide")
 init_db()
 
-st.title("Monitoramento de Processos - Escavador")
-st.caption("SQLite + Streamlit + webhook")
+st.title("Painel de Atualização de Processos")
+st.caption("Render + Streamlit + Postgres")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "Cadastrar processo",
-    "Processos",
-    "Movimentações",
-    "Callbacks",
-])
+webhook_url = os.getenv("WEBHOOK_PUBLIC_URL", "")
 
-with tab1:
-    st.subheader("Novo processo")
+col1, col2 = st.columns([2, 1])
+with col1:
+    st.write("Use este painel para cadastrar o processo, fazer a consulta inicial e ativar o monitoramento.")
+with col2:
+    if webhook_url:
+        st.info(f"Webhook: {webhook_url}")
 
-    with st.form("cadastro_processo"):
-        numero_cnj = st.text_input("Número CNJ", value="0000074-20.2026.5.06.0012")
-        origem = st.text_input("Origem", value="TRT-6")
+aba1, aba2, aba3 = st.tabs(["Cadastrar processo", "Movimentações", "Callbacks"])
+
+with aba1:
+    st.subheader("Cadastrar e monitorar processo")
+
+    with st.form("form_processo"):
+        numero_cnj = st.text_input("Número do processo", value="")
+        tribunal = st.text_input("Tribunal", value="TRT-6")
         frequencia = st.selectbox("Frequência", ["DIARIA", "SEMANAL"], index=0)
-        fazer_consulta = st.checkbox("Fazer consulta inicial agora", value=True)
-        criar_monitor = st.checkbox("Criar monitoramento agora", value=True)
-        submitted = st.form_submit_button("Cadastrar")
+        fazer_consulta = st.checkbox("Fazer consulta inicial", value=True)
+        criar_monitoramento = st.checkbox("Criar monitoramento no tribunal", value=True)
+        enviar = st.form_submit_button("Salvar")
 
-    if submitted:
+    if enviar:
         try:
-            info_origem = detalhes_origem(origem)
-            st.success(f"Origem válida: {info_origem.get('nome')}")
+            if not numero_cnj.strip():
+                st.error("Informe o número do processo.")
+            else:
+                if fazer_consulta:
+                    with st.spinner("Consultando processo no tribunal..."):
+                        resultado = registrar_consulta_inicial(numero_cnj, tribunal)
+                    st.success("Consulta inicial concluída")
+                    st.json(resultado)
 
-            if fazer_consulta:
-                with st.spinner("Consultando processo..."):
-                    resultado = registrar_consulta_inicial(numero_cnj, origem)
-                st.write("### Resultado da consulta inicial")
-                st.json(resultado)
+                if criar_monitoramento:
+                    with st.spinner("Criando monitoramento..."):
+                        monitor = criar_monitoramento_tribunal(numero_cnj, tribunal, frequencia)
+                    st.success("Monitoramento criado")
+                    st.json(monitor)
 
-            if criar_monitor:
-                with st.spinner("Criando monitoramento..."):
-                    monitor = criar_monitoramento(numero_cnj, origem, frequencia)
-                st.write("### Monitoramento criado")
-                st.json(monitor)
-
-            st.success("Processo cadastrado com sucesso.")
-
-        except EscavadorAPIError as e:
+        except EscavadorErro as e:
             st.error(str(e))
         except Exception as e:
             st.exception(e)
 
-with tab2:
+    st.divider()
     st.subheader("Processos cadastrados")
-    rows = listar_processos()
-    if rows:
-        df = pd.DataFrame([dict(r) for r in rows])
+    processos = listar_processos()
+    if processos:
+        df = pd.DataFrame(processos)
         st.dataframe(df, use_container_width=True)
     else:
-        st.info("Nenhum processo cadastrado.")
+        st.info("Nenhum processo cadastrado ainda.")
 
-    if st.button("Atualizar lista de monitoramentos do Escavador"):
-        try:
-            result = listar_monitoramentos()
-            st.json(result)
-        except Exception as e:
-            st.error(str(e))
-
-with tab3:
+with aba2:
     st.subheader("Movimentações")
+    processos = listar_processos()
+    opcoes = ["Todos"] + [p["numero_cnj"] for p in processos] if processos else ["Todos"]
+    filtro = st.selectbox("Filtrar por processo", opcoes)
 
-    rows_proc = listar_processos()
-    numeros = [r["numero_cnj"] for r in rows_proc]
-
-    numero_sel = st.selectbox(
-        "Filtrar por processo",
-        options=["Todos"] + numeros if numeros else ["Todos"]
-    )
-
-    if numero_sel != "Todos":
-        movs = listar_movimentacoes_processo(numero_sel)
+    rows = listar_movimentacoes(None if filtro == "Todos" else filtro)
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, height=500)
     else:
-        movs = listar_todas_movimentacoes()
+        st.info("Nenhuma movimentação registrada.")
 
-    if movs:
-        df_mov = pd.DataFrame([dict(r) for r in movs])
-        st.dataframe(df_mov, use_container_width=True, height=500)
-    else:
-        st.info("Nenhuma movimentação salva.")
-
-with tab4:
+with aba3:
     st.subheader("Callbacks recebidos")
-    callbacks = listar_callbacks()
-
-    if callbacks:
-        df_cb = pd.DataFrame([dict(r) for r in callbacks])
-        st.dataframe(df_cb, use_container_width=True, height=350)
-
-        with st.expander("Ver último payload"):
-            st.code(callbacks[0]["payload_json"], language="json")
+    rows = listar_callbacks()
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, height=350)
     else:
-        st.info("Nenhum callback recebido ainda.")
+        st.info("Nenhum callback recebido.")
