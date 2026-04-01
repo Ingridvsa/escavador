@@ -13,7 +13,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não definida.")
 
-# compatibilidade eventual
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
@@ -37,9 +36,15 @@ def init_db() -> None:
             id SERIAL PRIMARY KEY,
             numero_cnj TEXT NOT NULL UNIQUE,
             tribunal TEXT NOT NULL,
+            tipo_processo TEXT,
+            subtipo_processo TEXT,
+            nome_parte_principal TEXT,
+            valor_causa TEXT,
+            data_distribuicao TEXT,
             monitoramento_id BIGINT,
             frequencia TEXT,
             status_monitoramento TEXT,
+            payload_consulta_json TEXT,
             criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -86,7 +91,16 @@ def init_db() -> None:
         """))
 
 
-def upsert_processo(numero_cnj: str, tribunal: str) -> int:
+def processo_existe(numero_cnj: str) -> bool:
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT 1 FROM processos WHERE numero_cnj = :numero_cnj LIMIT 1"),
+            {"numero_cnj": numero_cnj},
+        ).first()
+        return row is not None
+
+
+def upsert_processo_basico(numero_cnj: str, tribunal: str) -> int:
     with get_conn() as conn:
         conn.execute(text("""
             INSERT INTO processos (numero_cnj, tribunal)
@@ -95,7 +109,10 @@ def upsert_processo(numero_cnj: str, tribunal: str) -> int:
             DO UPDATE SET
                 tribunal = EXCLUDED.tribunal,
                 atualizado_em = CURRENT_TIMESTAMP
-        """), {"numero_cnj": numero_cnj, "tribunal": tribunal})
+        """), {
+            "numero_cnj": numero_cnj,
+            "tribunal": tribunal,
+        })
 
         row = conn.execute(
             text("SELECT id FROM processos WHERE numero_cnj = :numero_cnj"),
@@ -103,6 +120,40 @@ def upsert_processo(numero_cnj: str, tribunal: str) -> int:
         ).mappings().first()
 
         return int(row["id"])
+
+
+def atualizar_detalhes_processo(
+    numero_cnj: str,
+    tribunal: str,
+    tipo_processo: str | None,
+    subtipo_processo: str | None,
+    nome_parte_principal: str | None,
+    valor_causa: str | None,
+    data_distribuicao: str | None,
+    payload_consulta_json: str | None,
+) -> None:
+    with get_conn() as conn:
+        conn.execute(text("""
+            UPDATE processos
+            SET tribunal = :tribunal,
+                tipo_processo = :tipo_processo,
+                subtipo_processo = :subtipo_processo,
+                nome_parte_principal = :nome_parte_principal,
+                valor_causa = :valor_causa,
+                data_distribuicao = :data_distribuicao,
+                payload_consulta_json = :payload_consulta_json,
+                atualizado_em = CURRENT_TIMESTAMP
+            WHERE numero_cnj = :numero_cnj
+        """), {
+            "numero_cnj": numero_cnj,
+            "tribunal": tribunal,
+            "tipo_processo": tipo_processo,
+            "subtipo_processo": subtipo_processo,
+            "nome_parte_principal": nome_parte_principal,
+            "valor_causa": valor_causa,
+            "data_distribuicao": data_distribuicao,
+            "payload_consulta_json": payload_consulta_json,
+        })
 
 
 def atualizar_monitoramento(
@@ -120,10 +171,10 @@ def atualizar_monitoramento(
                 atualizado_em = CURRENT_TIMESTAMP
             WHERE numero_cnj = :numero_cnj
         """), {
+            "numero_cnj": numero_cnj,
             "monitoramento_id": monitoramento_id,
             "frequencia": frequencia,
             "status_monitoramento": status_monitoramento,
-            "numero_cnj": numero_cnj,
         })
 
 
@@ -210,9 +261,20 @@ def listar_processos():
         rows = conn.execute(text("""
             SELECT *
             FROM processos
-            ORDER BY atualizado_em DESC, id DESC
+            ORDER BY tipo_processo NULLS LAST, subtipo_processo NULLS LAST, numero_cnj
         """)).mappings().all()
         return [dict(r) for r in rows]
+
+
+def buscar_processo_por_numero(numero_cnj: str):
+    with engine.connect() as conn:
+        row = conn.execute(text("""
+            SELECT *
+            FROM processos
+            WHERE numero_cnj = :numero_cnj
+        """), {"numero_cnj": numero_cnj}).mappings().first()
+
+        return dict(row) if row else None
 
 
 def listar_movimentacoes(numero_cnj: str | None = None):

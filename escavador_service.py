@@ -10,10 +10,12 @@ import requests
 from dotenv import load_dotenv
 
 from db import (
+    atualizar_detalhes_processo,
     atualizar_monitoramento,
     inserir_movimentacao,
+    processo_existe,
     salvar_consulta,
-    upsert_processo,
+    upsert_processo_basico,
 )
 
 load_dotenv()
@@ -63,6 +65,63 @@ def _request(method: str, endpoint: str, payload: dict[str, Any] | None = None) 
     return data
 
 
+def classificar_processo(tribunal: str) -> tuple[str, str | None]:
+    tribunal = (tribunal or "").upper().strip()
+
+    if tribunal.startswith("TRT"):
+        return "Trabalhista", None
+
+    if tribunal.startswith("TRF"):
+        return "Federal", None
+
+    if tribunal.startswith("TJ"):
+        uf = tribunal[-2:] if len(tribunal) >= 2 else None
+        return "Estadual", uf
+
+    return "Outros", None
+
+
+def extrair_nome_parte_principal(instancia: dict[str, Any]) -> str | None:
+    partes = instancia.get("partes") or []
+    if not partes:
+        return None
+
+    prioridades = ["RECLAMANTE", "AUTOR", "EXEQUENTE", "REQUERENTE"]
+
+    for prioridade in prioridades:
+        for parte in partes:
+            if (parte.get("tipo") or "").upper() == prioridade:
+                return parte.get("nome")
+
+    for parte in partes:
+        if (parte.get("polo") or "").upper() == "ATIVO":
+            return parte.get("nome")
+
+    return partes[0].get("nome")
+
+
+def extrair_detalhes_principais(resultado: dict[str, Any]) -> dict[str, Any]:
+    resposta = resultado.get("resposta") or {}
+    origem = resposta.get("origem")
+    instancias = resposta.get("instancias") or []
+    instancia_principal = instancias[0] if instancias else {}
+
+    tipo_processo, subtipo_processo = classificar_processo(origem or "")
+
+    valor_causa = instancia_principal.get("valor_causa")
+    if valor_causa is not None:
+        valor_causa = str(valor_causa)
+
+    return {
+        "tribunal": origem,
+        "tipo_processo": tipo_processo,
+        "subtipo_processo": subtipo_processo,
+        "nome_parte_principal": extrair_nome_parte_principal(instancia_principal),
+        "valor_causa": valor_causa,
+        "data_distribuicao": instancia_principal.get("data_distribuicao"),
+    }
+
+
 def consultar_processo(numero_cnj: str, tribunal: str) -> dict[str, Any]:
     payload = {
         "origem": tribunal,
@@ -88,8 +147,11 @@ def aguardar_resultado(busca_id: int, tentativas: int = 24, espera: int = 5) -> 
     return ultimo
 
 
-def registrar_consulta_inicial(numero_cnj: str, tribunal: str) -> dict[str, Any]:
-    processo_id = upsert_processo(numero_cnj, tribunal)
+def cadastrar_processo_se_nao_existir(numero_cnj: str, tribunal: str) -> dict[str, Any]:
+    if processo_existe(numero_cnj):
+        raise EscavadorErro("Processo já cadastrado na base.")
+
+    processo_id = upsert_processo_basico(numero_cnj, tribunal)
 
     inicio = consultar_processo(numero_cnj, tribunal)
     busca_id = inicio.get("id")
@@ -107,6 +169,18 @@ def registrar_consulta_inicial(numero_cnj: str, tribunal: str) -> dict[str, Any]
         resposta_json=json.dumps(final, ensure_ascii=False),
     )
 
+    detalhes = extrair_detalhes_principais(final)
+    atualizar_detalhes_processo(
+        numero_cnj=numero_cnj,
+        tribunal=detalhes.get("tribunal") or tribunal,
+        tipo_processo=detalhes.get("tipo_processo"),
+        subtipo_processo=detalhes.get("subtipo_processo"),
+        nome_parte_principal=detalhes.get("nome_parte_principal"),
+        valor_causa=detalhes.get("valor_causa"),
+        data_distribuicao=detalhes.get("data_distribuicao"),
+        payload_consulta_json=json.dumps(final, ensure_ascii=False),
+    )
+
     salvar_movimentacoes_da_consulta(processo_id, final, "consulta_inicial")
     return final
 
@@ -120,7 +194,9 @@ def salvar_movimentacoes_da_consulta(processo_id: int, resultado: dict[str, Any]
         for mov in instancia.get("movimentacoes") or []:
             data_mov = mov.get("data")
             conteudo = mov.get("conteudo") or ""
-            chave = hashlib.sha256(f"{processo_id}|{data_mov}|{conteudo}".encode("utf-8")).hexdigest()
+            chave = hashlib.sha256(
+                f"{processo_id}|{data_mov}|{conteudo}".encode("utf-8")
+            ).hexdigest()
 
             ok = inserir_movimentacao(
                 processo_id=processo_id,
