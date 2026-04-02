@@ -90,6 +90,19 @@ def init_db() -> None:
         )
         """))
 
+        # Migração defensiva para bancos já existentes
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS tipo_processo TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS subtipo_processo TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS nome_parte_principal TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS valor_causa TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS data_distribuicao TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS payload_consulta_json TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS monitoramento_id BIGINT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS frequencia TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS status_monitoramento TEXT"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS criado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
+        conn.execute(text("ALTER TABLE processos ADD COLUMN IF NOT EXISTS atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP"))
+
 
 def processo_existe(numero_cnj: str) -> bool:
     with engine.connect() as conn:
